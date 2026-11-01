@@ -1,394 +1,504 @@
-# Q1. Bike Rental Demand Prediction with Linear Regression
+# Q2. Radar Signal Classification with Support Vector Machines
 
-All code is in [`q1.ipynb`](q1.ipynb). Plots are in the [`figures/`](figures/) folder.
-To run it, open the notebook from inside the `q1/` folder and run all cells. It reads `data/hour.csv` and `data/bike_temp_comfort_zone.csv`.
+All code is in [`q2.ipynb`](q2.ipynb). Plots are in the [`figures/`](figures/) folder.
+To run it, open the notebook from inside the `q2/` folder and run all cells. It reads `data/ionosphere.data` and needs `numpy`, `pandas`, `matplotlib` and `cvxopt`.
 
-No library linear regression is used. I only use NumPy for matrix operations (matrix multiply, solving a linear system, and `lstsq` where the task allows it).
+**Rules I followed**
 
----
-
-## Data and split
-
-- Dataset: `hour.csv` from the UCI Bike Sharing Dataset. It has 17,379 rows, one per hour.
-- Target: `cnt`, the number of rentals in that hour.
-- I never use `casual` or `registered`, because they add up to `cnt`.
-- `weathersit = 4` (heavy rain or snow) appears in only 3 rows. A column for it would be almost all zeros, so I merged it into `weathersit = 3` (light rain or snow).
-
-**Split:** random 80 : 10 : 10, with random seed **42**.
-
-**What a random split means here:** the data is a time series, so a random split puts most validation hours right next to training hours from the same day. Because of this, the validation error shows how well the model fills in missing hours, not how well it predicts the future, so it is a bit too optimistic.
+- **Positive class = "good" = +1**, negative class = "bad" = −1.
+- **Random seed: 42.** One NumPy random generator makes both the train/test split and the folds.
+- **Support vectors:** a point counts as a support vector if **αᵢ > 1e-5**.
+- **No library SVM** (no `sklearn.svm`).
+- **`cvxopt.solvers.qp`** is used only as a general QP solver. I wrote the dual problem, its inputs, and the code that pulls out the support vectors, weights and bias myself.
+- **Metrics from scratch:** I wrote my own confusion matrix, accuracy, precision, recall and F1.
+- **Hyperparameters:** every one (learning rate, kernel, degree, γ, C) is chosen with **5-fold stratified cross-validation** on the training set. CV accuracy is the mean over the 5 folds.
+- **Test set:** not used until 2.5.
 
 ---
 
-## 1.1 Feature Engineering
+## 2.1 Preprocessing and Data Analysis
 
-### Problem with plain integers
+### 2.1.1 Inspecting the features
 
-A linear model treats an integer column as "each step up adds the same amount". That is wrong for these columns:
+The data has 351 rows and 34 feature columns (`a01` to `a34`), with no missing values. I looked at the mean, std, min, quartiles, max and number of unique values of every column (full table in the notebook).
 
-| Column | Why a plain integer is wrong | What I did |
+- **`a02` has no information.** It is 0 in all 351 rows (std 0, only 1 unique value), so it cannot tell any two rows apart. **I removed it.**
+- **What would go wrong if I kept it:** standardizing divides by the std, which is 0, so every value of `a02` would become 0/0 = NaN. That NaN would spread into every dot product, every kernel value and the QP matrix P, so the solver would fail or every prediction would be NaN. Even without standardizing, it would only add 0 to every dot product and distance, so it is useless. It would also be counted wrongly in γ = 1/(number of features) in 2.3.2.
+- **`a01` is kept.** It only takes the values 0 and 1, but it is useful: all 38 rows with `a01 = 0` are "bad".
+- The other 32 columns are continuous numbers in [−1, 1] with std between 0.44 and 0.65.
+
+**Feature columns left: 33.**
+
+### 2.1.2 Train/test split and cross-validation folds
+
+**Random seed: 42.**
+
+**How I split:** inside each class separately, I shuffled the rows and put 20% (rounded) into the test set. This is a stratified 80:20 split.
+
+| Set | Rows | Positive (good) | Negative (bad) | Positive share |
+|---|---|---|---|---|
+| All data | 351 | 225 | 126 | 0.641 |
+| **Train** | **281** | **180** | **101** | 0.641 |
+| **Test** | **70** | **45** | **25** | 0.643 |
+
+**How I built the 5 folds:** inside each class, I shuffled the training rows again and cut them into 5 nearly equal parts. Fold *k* = part *k* of the good rows + part *k* of the bad rows. Each fold is used once for validation, while the other 4 are used for training.
+
+| Fold | Rows | Good | Bad | Positive share |
+|---|---|---|---|---|
+| 1 | 57 | 36 | 21 | 0.632 |
+| 2 | 56 | 36 | 20 | 0.643 |
+| 3 | 56 | 36 | 20 | 0.643 |
+| 4 | 56 | 36 | 20 | 0.643 |
+| 5 | 56 | 36 | 20 | 0.643 |
+
+Every fold has almost the same class balance as the whole training set.
+
+### 2.1.3 Standardization
+
+For each feature, z = (x − mean) / std, where the mean and std come from the **training set only**. I used the same mean and std for the test set. The CV folds are just subsets of the standardized training rows, so nothing is refit for each fold. Before this, the training std of the features ranged from 0.30 to 0.64.
+
+**Why this matters for the kernels too, not just the linear model:**
+- **The kernels in 2.3 compare points using distances and dot products.** The polynomial kernel uses xᵀx′ and the RBF kernel uses ‖x − x′‖², so a feature with a bigger spread would control every kernel value.
+- **A fixed γ assumes equal scales.** A value like γ = 1/33 only means the same thing for every feature if all features are on the same scale.
+- **Fitting on training rows only** keeps the test set unseen, so it cannot shape the kernel.
+
+### 2.1.4 Visualization
+
+**1. Class balance**
+
+![Class balance](figures/class_balance.png)
+
+There are 225 good (64.1%) and 126 bad (35.9%) returns, so always guessing "good" already gives 64.1% accuracy; that is the bar every model must beat, and accuracy alone can hide weakness on the "bad" class.
+
+**2. Two features coloured by class (a03 vs a05)**
+
+![a03 vs a05](figures/pair_a03_a05.png)
+
+Good returns form one tight group in the top-right corner, while bad returns are spread over the whole square around it, which a single straight line cannot separate well.
+
+**3. Correlation heatmap of the 33 kept features**
+
+![Correlation heatmap](figures/feature_correlation.png)
+
+The odd-numbered features (a03, a05, …) are fairly strongly correlated with each other (mean |r| = 0.45, up to 0.83 for a13–a15), while the even-numbered ones are only weakly linked to them (mean |r| = 0.15), so many features partly repeat the same information.
+
+---
+
+## 2.2 Linear SVM from Scratch
+
+### 2.2.1 Primal formulation: subgradient descent
+
+The soft-margin linear SVM minimizes
+
+J(w, b) = ½‖w‖² + C · Σᵢ max(0, 1 − yᵢ(wᵀxᵢ + b)).
+
+The hinge part has a corner, so I use a **subgradient**. Let V be the points with yᵢ(wᵀxᵢ + b) < 1 (inside the margin or wrong). Then:
+
+- g_w = w − C · Σ_{i∈V} yᵢxᵢ
+- g_b = −C · Σ_{i∈V} yᵢ
+
+I **sum** the per-point subgradients over the batch (not average them), as the task asks. The batch is the whole training set. I start from w = 0, b = 0 and update w ← w − η·g_w, b ← b − η·g_b.
+
+**Learning rates tried:**
+- fixed η = 1e-4, 1e-3 and 1e-2;
+- a decreasing schedule, **η_t = 1e-2 / √(t + 1)**.
+
+For each C in {0.01, 0.1, 1, 10, 100} and each learning rate, I ran 10,000 iterations and measured 5-fold CV accuracy.
+
+| C | 1e-4 | 1e-3 | 1e-2 | 1e-2/√(t+1) |
+|---|---|---|---|---|
+| 0.01 | 0.8793 | 0.8722 | 0.8722 | 0.8722 |
+| **0.1** | 0.8757 | **0.8792** | 0.8721 | 0.8792 |
+| 1 | 0.8686 | 0.8686 | 0.8615 | 0.8722 |
+| 10 | 0.8581 | 0.8722 | 0.7653 | 0.8509 |
+| 100 | 0.8474 | 0.8545 | 0.8013 | 0.8545 |
+
+**What I observe with each learning rate.** "Swing" means how much the objective still moves over the last 1,000 steps, compared with its lowest value.
+
+- **1e-4: stable but too slow.** At C = 0.1 the objective is still 7.223 after 10,000 steps, while the true best value is 7.1865 (from the QP in 2.2.2). Its top CV score at C = 0.01 (0.8793) comes from weights that have not finished growing, not from a better model.
+- **1e-3: good at small C, unstable at large C.** At C = 0.1 it reaches the lowest objective of all (7.187) and hardly swings (0.04%). At C = 10 it swings by 98% of the objective, and at C = 100 by 32 times.
+- **1e-2: too big.** Because the subgradients are summed, the step grows with C and with the number of margin violators. Even at C = 0.1 it stops above the best value (7.208) and swings 0.5%. At C = 1 it swings 8×, at C = 10 48×, and CV accuracy falls to 0.77.
+- **Schedule 1e-2/√(t+1): fast start, never unstable, slow finish.** It starts as fast as 1e-2, but the shrinking steps stop the swinging at every C (at most 0.39 even at C = 100, against 201 for 1e-2). The cost is a slow finish: at C = 0.1 it ends at 7.191, a little behind 1e-3.
+
+Once the optimizer has converged, CV accuracy hardly depends on the learning rate: 0.8793 and 0.8792 differ by much less than one validation point (1/56 ≈ 0.018). Larger C gives lower CV accuracy (about 0.85), because there is less regularization.
+
+**My choice and why:**
+- **C = 0.1:** the best CV accuracy among runs that actually converged (0.8792). The exact QP in 2.2.2 confirms it.
+- **Fixed η = 1e-3:** at C = 0.1 it ties the schedule on CV accuracy (0.8792) but gets much closer to the true best solution (see 2.2.2). The schedule would be the safer choice if C were larger, where 1e-3 starts to swing.
+
+**Hyperparameters used:**
+
+| C | Learning rate | Iterations | Batch | Start |
+|---|---|---|---|---|
+| 0.1 | fixed 1e-3 | 10,000 | full training set (281 rows), subgradients summed | w = 0, b = 0 |
+
+### 2.2.2 Dual formulation: quadratic program
+
+**Derivation.** With slack variables ξᵢ, the primal is
+
+minimize ½‖w‖² + C Σᵢ ξᵢ, such that yᵢ(wᵀxᵢ + b) ≥ 1 − ξᵢ and ξᵢ ≥ 0.
+
+I add multipliers αᵢ ≥ 0 (for the margin constraints) and μᵢ ≥ 0 (for ξᵢ ≥ 0). Setting the derivatives of the Lagrangian to zero gives:
+
+- w = Σᵢ αᵢ yᵢ xᵢ
+- Σᵢ αᵢ yᵢ = 0
+- C − αᵢ − μᵢ = 0, which together with μᵢ ≥ 0 means **0 ≤ αᵢ ≤ C**
+
+Putting these back gives the **dual**:
+
+maximize Σᵢ αᵢ − ½ Σᵢ Σⱼ αᵢ αⱼ yᵢ yⱼ xᵢᵀxⱼ, such that 0 ≤ αᵢ ≤ C and Σᵢ αᵢ yᵢ = 0.
+
+**Standard QP form.** `cvxopt.solvers.qp` solves: minimize ½xᵀPx + qᵀx such that Gx ≤ h and Ax = b. I multiply the dual objective by −1 to turn "maximize" into "minimize".
+
+| Solver input | Value | What it is in my derivation |
 |---|---|---|
-| `hr` | Rentals do not go steadily up or down during the day. There are two rush-hour peaks on working days. Also 23:00 and 00:00 are neighbours, but the numbers are far apart. | One-hot (23 columns) |
-| `mnth` | Rentals rise in spring, stay high in summer and autumn, and drop in winter. December and January are neighbours. | One-hot (11 columns) |
-| `weekday` | Days are labels, not amounts. Sunday (0) and Saturday (6) are both weekend days but far apart as numbers. | One-hot (6 columns) |
-| `season` | 4 labels with no real order. | One-hot (3 columns) |
-| `weathersit` | Worse weather means fewer riders, but the drop from "clear" to "mist" is not the same size as from "mist" to "rain". | One-hot (2 columns) |
+| x | α (length n) | the multipliers, one per training point |
+| P | Pᵢⱼ = yᵢ yⱼ xᵢᵀxⱼ (n × n) | the quadratic part of the (negated) dual; for kernels xᵢᵀxⱼ becomes K(xᵢ, xⱼ) |
+| q | −1 (length n) | the linear part −Σᵢ αᵢ of the negated dual |
+| G | [−I ; I] (2n × n) | stacks −αᵢ ≤ 0 and αᵢ ≤ C |
+| h | [0 ; C·1] (length 2n) | the right-hand sides 0 and C |
+| A | yᵀ (1 × n) | the equality constraint Σᵢ αᵢ yᵢ … |
+| b | 0 | … = 0 |
 
-In every one-hot encoding I drop the first level. The intercept already covers that level, and keeping all levels would make the columns add up to the intercept column (see 1.3.1).
+**Getting the model out of the solution:**
+- **Support vectors:** αᵢ > 1e-5.
+- **Bias:** a point with 0 < αᵢ < C sits exactly on the margin, so b = yᵢ − Σⱼ αⱼ yⱼ K(xⱼ, xᵢ). I average this over all such margin support vectors.
+- **Decision function:** f(x) = Σ over SVs of αᵢ yᵢ K(xᵢ, x) + b.
+- **Linear kernel only:** w = Σᵢ αᵢ yᵢ xᵢ.
 
-Other columns:
-
-- `yr`, `holiday`: already 0/1, kept as they are.
-- `workingday`: **not used as its own column**. It is exactly "weekday is Monday to Friday, and not a holiday", so it can be built from the weekday columns and `holiday`, and adds nothing new. I checked this on every row. I still use it inside interactions.
-- `temp`, `hum`, `windspeed`: kept as numbers and standardized (see 1.2.2).
-- `atemp`: **dropped**. It is the "feels like" temperature, and its correlation with `temp` is 0.988, so it is almost a copy.
-
-### The five interaction terms
-
-An interaction lets the effect of one feature change depending on another feature.
-
-1. **weathersit × hr**: rain removes more riders at 17:00, when many people would ride, than at 03:00, when almost nobody rides.
-2. **temp × hr**: temperature matters most for leisure rides (midday, evening). Commuters ride at rush hour anyway.
-3. **hum × hr**: high humidity is most unpleasant in hot afternoons and matters little at night.
-4. **workingday × weathersit**: people going to work must travel even in bad weather, while weekend riders can stay home.
-5. **workingday × hr**: working days and non-working days have a completely different daily shape. On working days there are peaks at about 08:00 (~480 rentals) and 17:00 (~525). On weekends there is one wide peak around midday (~370). This is day type × time of day, not weather. I first tried weekday × season here, but it gave no improvement, so I replaced it.
-
-### Raw hour vs one-hot hour
-
-Two models, the same in every way except how hour is stored. In the raw model, the interactions with hour also use the raw number.
-
-| Hour encoding | Columns | Train RMSE | **Validation RMSE** |
-|---|---|---|---|
-| `hr` as one integer | 36 | 137.82 | **136.39** |
-| `hr` one-hot | 168 | 68.81 | **68.56** |
-
-**What the gap tells us:** with `hr` as one number, the model must assume that rentals change by the same amount every hour, so the daily pattern can only be a straight line going up or down. It also forces working days and weekends to differ only by a straight-line tilt. That cannot show the morning and evening peaks or the low at night. One-hot removes this assumption and cuts validation RMSE in half.
-
-### How much each interaction helps
-
-| Model | Columns | Train RMSE | Validation RMSE |
-|---|---|---|---|
-| All five interactions | 168 | 68.81 | 68.56 |
-| No interactions | 51 | 102.18 | 100.59 |
-| Without weathersit × hr | 122 | 69.98 | 68.90 |
-| Without temp × hr | 145 | 75.48 | 75.06 |
-| Without hum × hr | 145 | 68.94 | 68.72 |
-| Without workingday × weathersit | 166 | 68.81 | 68.54 |
-| Without workingday × hr | 145 | 95.22 | 93.83 |
-| Only temp × hr and workingday × hr | 97 | 70.49 | 69.76 |
-
-- workingday × hr helps the most, followed by temp × hr.
-- weathersit × hr and hum × hr help a little.
-- workingday × weathersit does not really help, but it only costs 2 columns, so I kept it.
-
-### Final design matrix
-
-**168 columns** (167 features + 1 intercept), with 13,903 training rows.
-
----
-
-## 1.2 Dataset Preprocessing and Analysis
-
-### 1.2.1 Train/val/test split
-
-| Set | Rows |
-|---|---|
-| Train | **13,903** |
-| Validation | **1,737** |
-| Test | **1,739** |
-
-### 1.2.2 Feature normalization
-
-**Standardization:** for `temp`, `hum` and `windspeed` I use z = (x − mean) / std. The mean and std come from the **training set only**, and I reuse them for validation and test. Interactions are built from the standardized values. The 0/1 columns are left as they are.
-
-| Feature | Train mean (as given) | Train std (as given) | After standardizing |
-|---|---|---|---|
-| temp | 0.498 | 0.192 | mean 0, std 1 |
-| hum | 0.627 | 0.193 | mean 0, std 1 |
-| windspeed | 0.190 | 0.123 | mean 0, std 1 |
-
-The dataset already gives these columns scaled into [0, 1]. So "without standardization" means using them as given: small numbers, but not centred at 0.
-
-**Gradient descent setup:**
-
-- Loss is the training MSE, (1/n)·‖Xw − y‖², with gradient (2/n)·Xᵀ(Xw − y).
-- It starts from w = 0 and uses all training rows in every step.
-- **Stable** means the loss is still finite after 2,000 steps and lower than at the start.
-- **Converged** means the training MSE is within 0.1% of the closed-form best value (4,734.53).
-
-**Which learning rates are stable:**
-
-| Learning rate | Standardized | Not standardized |
-|---|---|---|
-| 0.01 | stable | stable |
-| 0.1 | stable | stable |
-| 0.2 | stable | stable |
-| 0.3 | stable | stable |
-| 0.4 | stable | **diverged** |
-| 0.5 | stable | diverged |
-| 0.6 | **diverged** | diverged |
-| 1.0 | diverged | diverged |
-
-- Largest stable learning rate with standardization: **0.5**
-- Largest stable learning rate without standardization: **0.3**
-
-**Iterations to converge at a learning rate that is stable for both:**
-
-| Learning rate | Standardized | Not standardized | Ratio |
-|---|---|---|---|
-| **0.3** | **4,355** | **29,085** | 6.7× |
-| 0.1 | 13,064 | 87,254 | 6.7× |
-
-**What I observe and why:**
-
-| | Standardized | Not standardized |
-|---|---|---|
-| Largest eigenvalue of XᵀX/n | 1.903 | 2.587 |
-| Smallest eigenvalue of XᵀX/n | 9.9e-5 | 2.7e-5 |
-| Condition number | 1.93e4 | 9.43e4 |
-| Stability limit 1/λmax | 0.526 | 0.387 |
-
-- Gradient descent is only stable if the learning rate is below 1 / (largest eigenvalue). The limits above (0.526 and 0.387) match the table of stable learning rates.
-- Without standardization, the three columns are all positive numbers with a mean far from 0. So each interaction like temp × (hr = 17) becomes almost a copy of the (hr = 17) column. Their correlation is **0.933**, compared with **−0.004** after standardizing.
-- Near-copy columns make the loss surface long and thin. The largest eigenvalue gets bigger, so we need a smaller learning rate. The smallest eigenvalue gets smaller, so progress in that direction is slower. That is why it needs about 6.7 times more steps.
-- Both versions reach the **same** best MSE (4,734.53). Standardizing only changes how fast gradient descent gets there, not where it ends.
-
-**Loss vs iteration for different learning rates (standardized features):**
-
-![Gradient descent loss vs iteration](figures/gd_loss_vs_lr.png)
-
-| Learning rate | Steps run | Final MSE | Final MSE / best MSE |
-|---|---|---|---|
-| 1e-5 | 20,000 | 33,392 | 7.05 |
-| 1e-4 | 20,000 | 16,621 | 3.51 |
-| 1e-3 | 20,000 | 7,951 | 1.68 |
-| 1e-2 | 20,000 | 4,934 | 1.04 |
-| 0.1 | 20,000 | 4,737 | 1.001 |
-| 1.0 | 10 (stopped) | 4.4e12 | diverged |
-
-- **Very small learning rate (1e-5):** the loss is almost flat for the first ~1,000 steps. After 20,000 steps it is still 7 times the best value. The steps are simply too small.
-- **Very large learning rate (1.0):** this is above the limit of 0.526. Each step jumps past the minimum and lands further away than before, so the loss explodes. It goes from about 69,000 to more than 1e12 in 10 steps, and I stop the run.
-- **In the middle:** 0.1 reaches the best value (within 0.1%). 1e-2 follows the same path about 10 times slower.
-
-### 1.2.3 Visualization
-
-All plots use the training set only.
-
-**1. Distribution of the target**
-
-![Distribution of cnt](figures/cnt_distribution.png)
-
-Rentals per hour are strongly right-skewed (median 142, mean 190, max 976), and 17% of hours (2,333 of 13,903) have fewer than 20 rentals, so big errors will mostly come from busy hours and the model may predict below zero at night.
-
-**2. Hour of day vs rentals, for working and non-working days**
-
-![Mean rentals by hour](figures/cnt_by_hour_workingday.png)
-
-Working days have two sharp peaks (about 480 at 08:00 and 525 at 17:00), while weekends have one wide midday peak (about 370), which is why hour must be one-hot and why workingday × hr is so useful.
-
-**3. Temperature vs rentals**
-
-![Rentals vs temperature](figures/cnt_vs_temp.png)
-
-Rentals go up with temperature (correlation 0.40) up to about temp = 0.8 (around 33 °C) and then go down a little, so the relationship is not a straight line.
-
-**4. Correlation heatmap of all 167 engineered features and `cnt`**
-
-![Correlation heatmap](figures/feature_correlation_heatmap.png)
-
-Most features are close to uncorrelated. Each interaction is correlated with its parent column (for example workingday × (hr = k) with (hr = k) at about 0.82), and no single feature has a correlation with `cnt` above 0.40 (temp), so a good model needs many features together.
-
----
-
-## 1.3 Linear Regression from Scratch
-
-### 1.3.1 Closed-form solution
-
-Normal equation: setting the gradient of ‖Xw − y‖² to zero gives **XᵀX w = Xᵀy**. I solve this linear system directly with `np.linalg.solve`.
-
-**Condition numbers before solving (final 168-column matrix):**
+**Results at C = 0.1** (solver status: optimal):
 
 | | Value |
 |---|---|
-| cond(X) | **138.8** |
-| cond(XᵀX) | **1.93e4** (= 138.8², as expected) |
-| **Training RMSE** | **68.81** |
+| **Support vectors** | **96 of 281 = 34.2% of the training set** |
+| … on the margin (0 < α < C) | 20 |
+| … at the bound (α = C) | 76 |
+| Bias b | 0.2836 |
+| Dual objective | 7.1865 |
+| Primal objective of the recovered (w, b) | 7.1865 (same, so the answer is correct) |
+| Training accuracy | 0.9146 |
+| 5-fold CV accuracy | 0.8792 |
 
-This is **not** very large. We lose at most 4 to 5 of the 16 digits a computer keeps. The matrix is in good shape because 1.1 already avoided repeated information: one level is dropped from each one-hot group, `workingday` is not used alone, and `atemp` is dropped. What is left comes from rare 0/1 columns, such as rain at one specific hour, that are non-zero in only a few dozen rows.
+I also refit the exact QP for every C to check my choice of C. CV accuracy was 0.8722, **0.8792**, 0.8722, 0.8509 and 0.8439 for C = 0.01, 0.1, 1, 10 and 100, so C = 0.1 is best.
 
-**What happens with a redundant representation.** To show where a very large condition number comes from, I rebuilt the matrix in the naive way: keep **all** one-hot levels and add `workingday` as its own column.
+**Comparing the QP weights with the subgradient descent weights.** The table shows the largest elementwise difference. The largest QP weight is 0.616 in size.
 
-| Matrix | Columns | Rank | cond(X) | cond(XᵀX) |
-|---|---|---|---|---|
-| **Redundant** (all levels + workingday) | 174 | 168 | **2.02e16** | **2.01e17** |
-| **Corrected** (final, from 1.1) | 168 | 168 | **138.8** | **1.93e4** |
-| Corrected + atemp | 169 | 169 | 150 | 2.24e4 |
-
-**Diagnosis.** The redundant matrix has 174 columns but rank only 168, so 6 columns carry no new information. I found the 6 exact reasons, and each one holds with error 0 on every row:
-
-1. The 4 season columns add up to the intercept column.
-2. The 12 month columns add up to the intercept column.
-3. The 7 weekday columns add up to the intercept column.
-4. The 3 weather columns add up to the intercept column.
-5. The 24 hour columns add up to the intercept column.
-6. `workingday` = (weekday 1 + … + weekday 5) − `holiday`.
-
-Because of this, XᵀX cannot be inverted, and there is no single best answer. The condition number of about 1e16 to 1e17 is just the largest value the computer can show.
-
-- `np.linalg.solve` still returns *one* of the many answers. Training RMSE is 68.81, but the weights are arbitrary (the largest is 489.4).
-- An explicit matrix inverse gives nonsense: training RMSE **24,279**.
-
-**Correction:** drop one level from each one-hot group and do not use `workingday` as its own column. This gives the final 168-column matrix, with cond(X) = 138.8 and cond(XᵀX) = 1.93e4. Adding back `atemp`, which is only *almost* a copy of `temp`, raises them only a little (150 and 2.24e4).
-
-### 1.3.2 Gradient descent
-
-I used the gradient descent from 1.2.2 on the same matrix, with learning rate **0.5** (the largest stable one), starting from w = 0, and compared its weights with the closed-form weights.
-
-| Iterations | Largest weight difference | Relative difference | Train RMSE (GD) |
-|---|---|---|---|
-| 1,000 | 56.0 | 0.235 | 69.0289 |
-| 10,000 | 18.1 | 0.0783 | 68.8139 |
-| 50,000 | 0.350 | 1.5e-3 | 68.8079 |
-| 100,000 | 2.5e-3 | 1.1e-5 | 68.8079 |
-| 200,000 | 1.3e-7 | 5.5e-10 | 68.8079 |
-| 300,000 | **5.5e-11** | **2.3e-13** | 68.8079 |
-
-**The correctness check passes.** After 300,000 steps, the weights match the closed-form weights up to a difference of 5.5e-11, which is the limit of computer precision. For example, the largest weight (workingday × hr = 8) is 428.714305 in both.
-
-**Why so many steps?** The loss is almost at its best after about 10,000 steps, but some weights are still off by up to 18. Those weights belong to rare columns (rain at a particular hour). They affect very few rows, so the gradient pushes them very slowly: in that direction the error only shrinks by a factor of e about every 10,000 steps. Checking the weights is therefore a stricter test than checking the loss.
-
----
-
-## 1.4 Polynomial Features and the Bias-Variance Tradeoff
-
-Dataset: `bike_temp_comfort_zone.csv`, using its own `split` column (400 train, 200 validation, 200 test).
-For each degree d = 1 to 12, the features are temp, temp², …, tempᵈ. Each power is standardized with the training mean and std of that power, an intercept is added, and the model is fit with the closed-form normal equation.
-
-| Degree | Train RMSE | Val RMSE | Largest \|coefficient\| | cond(XᵀX) |
-|---|---|---|---|---|
-| 1 | 117.287 | 121.770 | 73.3 | 1 |
-| 2 | 79.083 | 74.988 | 404 | 60 |
-| 3 | 63.348 | 60.557 | 701 | 2.3e3 |
-| 4 | 60.978 | 57.773 | 2,690 | 9.2e4 |
-| **5** | 60.297 | **56.720** | 4,020 | 3.2e6 |
-| **6** | 60.292 | **56.714** | 1,880 | 1.0e8 |
-| **7** | 60.290 | **56.691** | 7,350 | 3.6e9 |
-| 8 | 60.235 | 57.172 | 216,000 | 1.2e11 |
-| 9 | 60.133 | 57.527 | 1.74e6 | 4.2e12 |
-| 10 | 59.810 | 58.160 | 1.63e7 | 1.3e14 |
-| 11 | 59.659 | 59.117 | 6.69e7 | 4.5e15 |
-| 12 | 61.116* | 58.822 | 5.34e8 | 7.8e16 |
-
-\* See the note on degree 12 below.
-
-![Train and validation error vs degree](figures/poly_error_vs_degree.png)
-
-**Region where validation error is lowest: degrees 5 to 7.** Their validation RMSEs are within 0.1% of each other. Degree 4 (57.77) and degree 8 (57.17) are clearly worse.
-
-- **Left side (degrees 1 to 4), underfitting / high bias.** Both errors are high and fall quickly together. A straight line cannot bend. A parabola can only make a symmetric hill, but the real curve rises slowly, peaks near temp = 0.65, and falls faster. The model is too simple.
-- **Right side (degrees 8 to 12), overfitting / high variance.** Training error keeps going down a little, but validation error goes up (from 56.69 to about 59). The extra powers start fitting the noise in the 400 training points. The degree-12 curve wiggles, especially at the edges.
-
-![Fitted curves at degree 1, 7 and 12](figures/poly_fits.png)
-
-**Largest coefficient vs degree (log scale):**
-
-![Largest coefficient vs degree](figures/poly_max_coef_vs_degree.png)
-
-The largest coefficient grows from 73 at degree 1 to about 5e8 at degree 12. It jumps about 30 times between degrees 7 and 8, which is the same place where validation error starts to rise. High powers of temp look almost the same as each other, so the model builds its curve from huge positive and negative coefficients that cancel out. This makes the model very sensitive to small changes in the data.
-
-**Test RMSE at the chosen degree (degree 7, lowest validation error in the region): 52.614.** The test set was used only for this one model.
-
-**Note on degree 12:** cond(XᵀX) is 7.8e16, which is too large for the computer to handle accurately. The normal-equation fit gives training RMSE 61.12, which is *higher* than degree 11. That is impossible for a real best fit, because degree 12 can always copy degree 11. It is a rounding error. `np.linalg.lstsq` gives 59.39 at degree 12, and both methods agree for degrees 1 to 11, so the chosen region and the test result are not affected.
-
----
-
-## 1.5 Regularization
-
-**Ridge regression** minimizes ‖Xw − y‖² + λ·(sum of squared weights, not counting the intercept).
-Setting the gradient to zero gives **(XᵀX + λD) w = Xᵀy**, where D is the identity matrix with a 0 in the intercept position, so the intercept is not shrunk. I solve this with `np.linalg.solve`. For λ = 0, I use the least-squares solver `np.linalg.lstsq`, as the task asks.
-
-Preprocessing: the penalty treats all weights the same, so I standardize **every** feature column using the rows being fit, after dropping columns with zero variance. Both sweeps are scored on the same 1,737-row validation set.
-
-### Full training set (13,903 rows, 168 columns, 0 columns dropped)
-
-![Ridge on the full training set](figures/ridge_full.png)
-
-| λ | Train RMSE | Val RMSE |
+| Iterations | Fixed η = 1e-3 | Schedule 1e-2/√(t+1) |
 |---|---|---|
-| 0 | 68.808 | 68.560 |
-| 1e-2 | 68.808 | 68.560 |
-| 1 | 68.808 | 68.558 |
-| 10 | 68.810 | 68.541 |
-| **100** | 68.954 | **68.530** |
-| 1e3 | 72.825 | 71.848 |
-| 1e4 | 96.931 | 96.239 |
-| 1e5 | 149.000 | 150.547 |
-| 1e6 | 176.911 | 179.315 |
+| 100 | 0.356 | 0.288 |
+| 1,000 | 0.096 | 0.158 |
+| 10,000 | **0.0011** | 0.033 |
 
-**Best λ = 100.** Validation RMSE goes from 68.560 to 68.530, an improvement of only **0.031 (0.04%)**, which is basically nothing. Above λ = 1,000 the penalty removes real signal and both errors go up. At λ = 1e6 the model almost just predicts the average.
+- **Fixed 1e-3:** the difference falls fast, to 0.2% of the largest weight after 10,000 steps (the bias difference falls from 0.076 to 0.0012). A fixed step can only get within some distance of the answer, and that distance shrinks as η shrinks. The objective plot in 2.2.3 shows this run reaching that floor after about 2,000 steps. At η = 1e-3 the floor is small, so the weights match the QP.
+- **Schedule:** it is ahead at 100 steps because its first steps are 10× bigger, but it falls behind later. Its steps shrink like 1/√t, so its error also shrinks slowly (0.288 → 0.158 → 0.033). It never swings and is still improving, but it needs many more steps.
 
-### Random 100-row subsample of the training set (seed 42)
+Both runs are clearly moving towards the QP weights, so the primal and dual code solve the same problem.
 
-28 columns were constant in these 100 rows, mostly rare interaction cells, so I dropped them. That leaves 139 features + 1 intercept = 140 columns for only 100 rows.
+### 2.2.3 Convergence and comparison
 
-![Ridge on 100 rows](figures/ridge_subsample.png)
+![Objective vs iteration](figures/primal_objective.png)
 
-| λ | Train RMSE | Val RMSE |
-|---|---|---|
-| 0 | 0.00 | 324.26 |
-| 1e-2 | 0.77 | 314.90 |
-| 1 | 18.68 | 155.31 |
-| **10** | 35.88 | **130.16** |
-| 100 | 74.09 | 131.06 |
-| 1e3 | 147.13 | 160.72 |
-| 1e4 | 182.28 | 180.69 |
-| 1e5 | 187.41 | 183.73 |
-| 1e6 | 187.94 | 184.05 |
+The left plot shows the objective. The right plot shows how far each run still is from the QP's best value. All four use C = 0.1 and 10,000 steps.
 
-**Best λ = 10.** Validation RMSE goes from 324.26 to 130.16, an improvement of **194.10 (59.9%)**.
+- **All start at J = 28.1.** With w = 0, each of the 281 points has hinge loss 1, and 0.1 × 281 = 28.1.
+- **Bigger steps start faster.** 1e-2 and the schedule are below 8 within 100 steps, 1e-3 gets there by about 1,000, and 1e-4 is about 10× slower again.
+- **1e-2 stops improving after about 200 steps** and then jumps around at a gap of about 0.01. Subgradient descent does not always go downhill, so a fixed step keeps circling the corner of the hinge loss instead of settling.
+- **1e-3 does the same, but about 10× lower.** It bounces around a gap of about 1e-3 from about 2,000 steps on. The floor of a fixed step shrinks with η.
+- **The schedule is the only run with no floor.** It keeps going down smoothly (gap 0.0041 at 10,000 steps) and would pass 1e-3 with more steps.
+- **1e-4 is smooth but slow:** still 0.036 away after 10,000 steps.
 
-To check that this is not luck, I repeated it with 20 other random 100-row subsamples:
+**Training time** on 281 rows × 33 features, best of several runs:
 
-- The best λ was 100 in 16 cases, 10 in 3 cases, and 1e5 in 1 case.
-- The improvement was always large: median 120.1, smallest 29.5, largest 915.7.
-
-### Comparing the two improvements
-
-| Training data | Best λ | Improvement in validation RMSE |
-|---|---|---|
-| Full (13,903 rows) | 100 | 0.031 (0.04%) |
-| 100 rows | 10 | 194.10 (59.9%) |
-
-**Why they are so different:** ridge adds a little **bias** (it pulls weights towards 0) in exchange for less **variance** (weights that change less when the training data changes). It only helps when variance is the bigger problem.
-
-- **Full training set: almost no variance to remove.** There are about 83 rows for every weight, and the matrix is well-conditioned (cond(X) = 139). The normal least-squares weights are already stable, so shrinking them mainly adds bias.
-- **100 rows: variance is huge.** There are more weights (140) than rows (100), so XᵀX cannot be inverted and many different weight vectors fit the training rows perfectly (train RMSE 0). The one we get fits the noise and fails on new data. Ridge makes the system solvable and shrinks the weights that the data barely supports, which removes a lot of variance.
-- **The same λ is stronger when there is less data.** The error part of the loss is a sum over rows, so it grows with the number of rows, but the penalty part does not. λ = 100 is tiny compared with 13,903 rows of error, but strong compared with 100 rows.
-
-Even the best 100-row model (130) is much worse than the full-data model (68.5). Regularization reduces overfitting, but it cannot replace having more data.
-
----
-
-## 1.6 Evaluation
-
-Model: ridge regression from 1.5, fit on the full training set with **λ = 100** (chosen by the full-training-set sweep), with the same training-set standardization. It is evaluated once on the 1,739-row test set. The metrics are implemented from scratch, and predictions are **not clipped**.
-
-| Metric | Test set |
+| Method | Time |
 |---|---|
-| MAE | **49.02** |
-| RMSE | **67.03** |
-| R² | **0.857** |
-| Pearson correlation | **0.926** |
+| Subgradient descent, 10,000 steps | about **0.20 s** |
+| cvxopt QP | about **0.06 s** |
 
-- The model explains about 86% of the variation in hourly rentals.
-- Test RMSE (67.03) is close to training (68.95) and validation (68.53) RMSE, so the model is not overfitting.
-- MAE is lower than RMSE because a few big errors at busy rush hours count extra in RMSE.
+The QP is faster here, but **I expect subgradient descent to scale much better as the number of training examples n grows:**
+- **Subgradient descent:** each step costs O(n·d) time and only needs the data itself, so the cost grows linearly with n. With mini-batches, each step can even be independent of n.
+- **QP:** needs a dense n × n matrix P, which costs O(n²·d) time and O(n²) memory to build. Each interior-point step solves an n × n system, which costs O(n³). For n = 100,000, P alone would need 80 GB of memory.
 
-**Negative predictions:**
+---
 
-- **181 of 1,739 test predictions (10.4%) are below zero**, the lowest being −108.6, even though a rental count can never be negative.
-- 161 of them are at night or early morning (00:00 to 07:59). The real counts in these rows are very small (median 9, maximum 77).
-- This happens because a linear model just adds effects together. A low night-time value plus negative effects (rain, high humidity, winter, first year) can add up to less than zero.
-- The model also assumes errors are the same size at every level of demand, but real counts vary little near zero and a lot at peak hours.
-- For comparison only (not the reported numbers): if predictions were clipped at 0, the results would be MAE 45.42, RMSE 64.99, R² 0.866, Pearson 0.932. Clipping can only help, because the true value is never below 0.
-- A better fix would be to predict log(cnt + 1) or to use a model made for counts (such as Poisson regression). Neither can give negative rentals.
+## 2.3 Kernels
+
+The kernel replaces the dot product xᵢᵀxⱼ in the matrix P and in the decision function. My `fit_dual_svm` function takes the kernel as an input, so nothing else changes.
+
+**How I chose settings:** the degree (or γ) and C are chosen **together** by 5-fold CV over a grid with C ∈ {0.01, 0.1, 1, 10, 100}. Ties go to the smaller degree or γ, then the smaller C. The curves and boundary plots below keep C fixed at the chosen value, so only the degree or γ changes.
+
+### 2.3.1 A case where linear fails
+
+**Baseline:** always predicting the majority class of the training folds ("good") gives **5-fold CV accuracy 0.6406**.
+
+**Search:** I did not guess. I fit the linear QP on **all 528 pairs** of the 33 features (C = 1, 5-fold CV). **234 pairs** do not beat the baseline. I then re-checked the 40 weakest pairs with C tuned over the full grid, and compared them with an RBF kernel, to find a pair where the problem is the *shape* of the classes rather than a useless pair.
+
+**The pair I report: a21 & a28.**
+
+| C | 0.01 | 0.1 | 1 | 10 | 100 |
+|---|---|---|---|---|---|
+| Linear SVM CV accuracy | **0.6406** | 0.637 | 0.619 | 0.619 | 0.616 |
+
+**Best linear SVM CV accuracy: 0.6406** (C = 0.01), which is exactly the baseline. At that C the solver returns w = 0 and b = 1, so it just predicts "good" for every point. Every other C is worse than the baseline.
+
+![Linear SVM on a21 and a28](figures/pair_linear_boundary.png)
+
+In both plots the whole area is on the "good" side, so there is no boundary line inside the data.
+
+**Why a straight line cannot do better:**
+- The **bad** points are in two places: a small group in the **middle** (around a21 ≈ −0.5, a28 ≈ 0 to 0.5), and a scattered **outer ring** at the edges (a28 near ±1.5–2, a21 at its extremes).
+- The **good** points fill the space **between** them.
+
+A straight line splits the plane into two halves, so it can cut off part of the ring or the middle group, but never both. Any such cut also removes many good points. Every line loses about as many good points as it gains bad ones, so the best linear rule is "always say good".
+
+**Kernels do much better on the same pair:**
+- RBF (γ = 1, C = 100): **CV accuracy 0.8788**
+- Polynomial (degree 5, C = 10): **CV accuracy 0.8788**
+
+That is about **24 percentage points** better, because both kernels can draw closed, curved boundaries.
+
+### 2.3.2 Polynomial kernel
+
+K(x, x′) = (γ·xᵀx′ + coef0)^d
+
+**Values used:**
+
+| Setting | Value |
+|---|---|
+| γ on all 33 kept features | **1/33 ≈ 0.0303** |
+| γ on the 2-feature pair (2 features used) | **1/2** |
+| coef0 | **1** (everywhere) |
+| Degree | swept from 1 to 5 |
+
+**CV accuracy for every (degree, C) on all 33 features:**
+
+| Degree | C = 0.01 | C = 0.1 | C = 1 | C = 10 | C = 100 |
+|---|---|---|---|---|---|
+| 1 | 0.6406 | 0.8330 | 0.8685 | 0.8722 | 0.8615 |
+| **2** | 0.6406 | 0.8722 | 0.9005 | **0.9219** | 0.9079 |
+| 3 | 0.7047 | 0.8863 | 0.9078 | 0.9113 | 0.9078 |
+| 4 | 0.7439 | 0.8863 | 0.9041 | 0.9006 | 0.9078 |
+| 5 | 0.7724 | 0.8863 | 0.8970 | 0.8898 | 0.8898 |
+
+**Degree with the lowest CV error: 2** (C = 10, CV accuracy **0.9219**).
+
+![Polynomial accuracy vs degree](figures/poly_accuracy_vs_degree.png)
+
+At C = 10:
+
+| Degree | 1 | **2** | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| Training accuracy | 0.940 | 0.989 | 1.000 | 1.000 | 1.000 |
+| CV accuracy | 0.872 | **0.922** | 0.911 | 0.901 | 0.890 |
+| Support vectors | 85 | 69 | 61 | 62 | 67 |
+
+- **Below degree 2 (degree 1): too simple.** It is basically linear (training accuracy 0.94, CV accuracy 0.87).
+- **Above degree 2 (degrees 3–5): overfitting.** Training accuracy is 100%, but CV accuracy keeps falling (0.911, 0.901, 0.890).
+
+**The boundary on the a21 & a28 pair** (C = 10 in every plot):
+
+![Polynomial boundaries on the pair](figures/poly_pair_boundaries.png)
+
+- **Degree 1 (below the best degree):** no boundary in the data area; everything is called "good" (CV accuracy 0.619, all 281 points are support vectors).
+- **Degree 2 (the best degree on all features):** a smooth **horizontal band**. It calls the extreme a28 values "bad", so it catches the outer ring but not the middle bad group (CV accuracy 0.776).
+- **Degrees 3–5 (above it):** the boundary gets more and more bendy.
+  - Degree 3 bends the band.
+  - Degree 4 cuts a **pocket** around the middle bad group.
+  - Degree 5 adds a separate "bad" island in the top-right corner and wraps tightly around small groups of points.
+  - CV accuracy: 0.779, 0.847, 0.879.
+
+On this 2-feature pair, the extra bending still helps, because two features alone need a complicated boundary. On all 33 features a degree-2 boundary is enough, and higher degrees start to overfit.
+
+### 2.3.3 RBF kernel
+
+K(x, x′) = exp(−γ‖x − x′‖²), with γ ∈ {0.001, 0.01, 0.1, 1, 10, 100}.
+
+**CV accuracy for every (γ, C) on all 33 features:**
+
+| γ | C = 0.01 | C = 0.1 | C = 1 | C = 10 | C = 100 |
+|---|---|---|---|---|---|
+| 0.001 | 0.6406 | 0.6406 | 0.7615 | 0.8970 | 0.9290 |
+| 0.01 | 0.6406 | 0.7225 | 0.9325 | 0.9575 | 0.9610 |
+| **0.1** | 0.6406 | 0.6727 | 0.9538 | 0.9645 | **0.9680** |
+| 1 | 0.6406 | 0.6406 | 0.6727 | 0.6727 | 0.6727 |
+| 10 | 0.6406 | 0.6406 | 0.6406 | 0.6477 | 0.6477 |
+| 100 | 0.6406 | 0.6406 | 0.6406 | 0.6406 | 0.6406 |
+
+**Best γ: 0.1** (C = 100, CV accuracy **0.9680**).
+
+![RBF accuracy and support vectors vs gamma](figures/rbf_accuracy_vs_gamma.png)
+
+| γ | 0.001 | 0.01 | **0.1** | 1 | 10 | 100 |
+|---|---|---|---|---|---|---|
+| Training accuracy (C = 100) | 0.972 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| CV accuracy (C = 100) | 0.929 | 0.961 | **0.968** | 0.673 | 0.648 | 0.641 |
+| Support vectors (C = 100) | 79 | 55 | 149 | 250 | 281 | 281 |
+| Support vectors (C = 1) | 198 | 111 | 152 | 247 | 281 | 281 |
+
+**The boundary on the a21 & a28 pair** (C = 100 in every plot):
+
+![RBF boundaries on the pair](figures/rbf_pair_boundaries.png)
+
+**Very small γ (0.001): smooth, almost straight boundary.** The kernel hardly changes over the whole data range, so every point looks similar to every other one and the model behaves almost like a linear model.
+- On the pair, γ = 0.001 draws no boundary at all (everything "good"), and γ = 0.01 draws two almost straight horizontal bands.
+- On all features the model is a little too simple (training accuracy 0.972, CV accuracy 0.929).
+
+**Very large γ (10, 100): the boundary breaks into small islands.** The kernel is so local that each point only "sees" itself.
+- On the pair, γ = 100 draws a tiny circle around almost every single bad training point, and everything else is "good".
+- On all features the model memorizes the training data (training accuracy 1.0), but CV accuracy drops to the baseline (0.648, 0.641): a new point is far from every training point and just gets the default answer.
+
+**Number of support vectors at the extremes:**
+- **Large γ:** it goes up to **all 281 training points** at γ = 10 and 100. The kernel matrix is almost the identity, so no point can be explained by its neighbours and every point must hold up its own label.
+- **Small γ:** it depends on C. It is 79 at C = 100 but **198 at C = 1**, because the almost-straight boundary cannot separate the classes well and many points end up inside the margin.
+- **In the middle:** the count is lowest at medium γ (55 at γ = 0.01, C = 100).
+
+### 2.3.4 Comparative study
+
+| Kernel | Setting | C | CV accuracy | Support vectors | Training time (one fit, full training set) |
+|---|---|---|---|---|---|
+| Linear | – | 0.1 | 0.8792 | 96 | ≈ 0.05 s |
+| Polynomial | degree 2, γ = 1/33, coef0 = 1 | 10 | 0.9219 | 69 | ≈ 0.07 s |
+| **RBF** | **γ = 0.1** | **100** | **0.9680** | 149 | ≈ 0.07 s |
+
+The training times are all about the same. With only 281 rows, the time is mostly spent on the same 281 × 281 QP, whichever kernel fills the matrix.
+
+**I would choose the RBF kernel.** It has the highest CV accuracy by a clear margin: 4.6 points above polynomial and 8.9 points above linear.
+
+**Why it wins on Ionosphere:**
+- **Good returns follow one pattern.** A "good" return is a real echo from structure in the ionosphere, so its 17 pulse measurements follow a steady pattern. Section 2.1.4 shows this: good returns form one tight group in the a03/a05 plot, and the odd-numbered features are strongly linked.
+- **Bad returns are scattered.** A "bad" return passes straight through, so its values look like noise and are spread in every direction around that group.
+- **So the real question is "Is this return close to the typical good pattern?"** That means drawing a closed area around one group, not cutting the space in half.
+- **RBF does exactly that.** Its decision is a weighted sum of similarities exp(−γ‖x − xᵢ‖²) to the support vectors, so it naturally draws closed, local boundaries around a group.
+- **The others can't.** A linear kernel can only cut the space in half. A degree-2 polynomial can make rough ellipse-like shapes, which is why it comes second.
+
+---
+
+## 2.4 The Regularization Parameter C
+
+I used the chosen kernel (**RBF, γ = 0.1**) and swept C over {0.01, 0.1, 1, 10, 100}.
+
+![Error and support vectors vs C](figures/c_sweep.png)
+
+| C | 0.01 | 0.1 | 1 | 10 | **100** |
+|---|---|---|---|---|---|
+| Training error | 0.359 | 0.064 | 0.014 | 0.000 | 0.000 |
+| CV error | 0.359 | 0.327 | 0.046 | 0.036 | **0.032** |
+| Support vectors | 207 | 208 | 152 | 151 | 149 |
+| … at the bound (α = C) | 194 | 194 | 30 | 0 | 0 |
+
+**Best C: 100** (CV error **0.0320**, no tie). Compared with the smallest C (0.01, CV error 0.3594), this is an improvement of **0.327, which is 32.7 percentage points** of CV error.
+- **Where the gain comes from:** most of it happens between C = 0.1 and C = 1.
+- **After C = 1:** CV error only goes down about 1.4 more points, which is roughly 4 validation points.
+- **Edge of the grid:** C = 100 is the largest value in the sweep, but the curve is already flat there.
+
+**What C controls.** C is the price paid for each margin violation (hinge loss), compared with keeping a wide margin. It is also the largest value any α can take.
+
+- **Small C: the model underfits.** Violations are cheap and every α is capped at a tiny number, so the decision function is almost constant.
+  - At C = 0.01 the model says "good" for everything: training and CV error are both 0.359, the majority-class error.
+  - At C = 0.1 it starts to fit the training set (training error 0.064) but still acts almost like the baseline on new data (CV error 0.327).
+- **Large C: the model fits the training data more closely.** Violations are expensive. Training error reaches 0 from C = 10, and CV error falls to about 0.03. With γ = 0.1 the boundary is smooth enough that fitting the training set exactly does not yet hurt CV error, so there is no overfitting within this sweep.
+
+**What happens to the number of support vectors as C grows:** it goes **down**, from about 207 to 149.
+- **Small C:** the margin is wide, almost every point is inside it, and those points are stuck at α = C (194 of 207).
+- **Growing C:** the margin gets narrower, fewer points break it, and the points at the bound disappear completely (0 from C = 10).
+- **What stays:** about 150 points on the margin, which define the boundary. The count levels off instead of going to zero, because a curved boundary in 33 dimensions needs many points to hold it in place.
+
+---
+
+## 2.5 Evaluation
+
+**C for each SVM,** tuned separately by 5-fold CV with the other settings fixed:
+
+| Model | C = 0.01 | C = 0.1 | C = 1 | C = 10 | C = 100 | **C used** |
+|---|---|---|---|---|---|---|
+| Linear SVM | 0.8722 | **0.8792** | 0.8722 | 0.8509 | 0.8439 | **0.1** |
+| Polynomial SVM (degree 2) | 0.6406 | 0.8722 | 0.9005 | **0.9219** | 0.9079 | **10** |
+| RBF SVM (γ = 0.1) | 0.6406 | 0.6727 | 0.9538 | 0.9645 | **0.9680** | **100** |
+
+Each model was refit on the full training set and tested **once** on the 70 test rows (45 good, 25 bad). The trivial classifier always predicts the training majority class, "good".
+
+**Test results** (precision, recall and F1 are for the positive class, "good"):
+
+| Model | Accuracy | Precision | Recall | F1 | TP | FN | FP | TN |
+|---|---|---|---|---|---|---|---|---|
+| Linear SVM (C = 0.1) | 0.8857 | 0.8776 | 0.9556 | 0.9149 | 43 | 2 | 6 | 19 |
+| Polynomial SVM (degree 2, C = 10) | 0.9000 | 0.9130 | 0.9333 | 0.9231 | 42 | 3 | 4 | 21 |
+| **RBF SVM (γ = 0.1, C = 100)** | **0.9286** | **0.9762** | 0.9111 | **0.9425** | 41 | 4 | 1 | 24 |
+| Trivial (always "good") | 0.6429 | 0.6429 | 1.0000 | 0.7826 | 45 | 0 | 25 | 0 |
+
+- **RBF is the best** on accuracy, precision and F1. It calls only **1** of the 25 bad returns "good", while the linear SVM lets **6** through (the pattern studied in 2.6). The price is slightly lower recall: RBF misses 4 good returns, linear misses 2.
+- **The order on the test set is the same as in CV:** RBF > polynomial > linear > trivial.
+- **RBF's test accuracy (0.929) is a bit lower than its CV accuracy (0.968).** This is normal noise with only 70 test rows: one row is worth 1.4 percentage points, and the usual uncertainty of an accuracy near 0.93 on 70 rows is about 3 points.
+
+**What the trivial baseline's accuracy hides:**
+- **Its numbers look fine:** 64.3% accuracy, recall 1.0 and F1 0.78.
+- **But they are free:** "good" is both the majority class (64% of the data, see 2.1.2) and the positive class, so always saying "good" gets these numbers without looking at the data.
+- **The confusion matrix shows the truth:** **TN = 0 and FP = 25**. It never finds a single bad return and uses no information from the radar signal at all.
+- **So judge accuracy against 64%, not 50%.** A model is only useful if it finds the smaller "bad" class, which needs the confusion matrix or per-class precision and recall, not accuracy alone.
+
+---
+
+## 2.6 Support Vectors and Error Analysis
+
+The **best overall model** is the RBF SVM (γ = 0.1, C = 100): it has the highest CV accuracy (0.968), and the test results agree. The **linear SVM from 2.2.2** is the QP linear SVM with C = 0.1. The hinge loss of a training point is max(0, 1 − yᵢ f(xᵢ)). A point counts as having non-zero hinge loss if this is above **1e-3**.
+
+**Support vectors of the best model:** **149 of 281 = 53.0% of the training set.** All 149 are on the margin (0 < α < C), and none are at the bound.
+
+**What that suggests about the fit:**
+- **It is a flexible, local fit.** More than half the training points are needed to describe the boundary. With γ = 0.1 each support vector only affects the area near it, so the boundary is built piece by piece from many points.
+- **No training point is inside the margin.** The training set is separated perfectly, which on its own could mean overfitting. But the good CV accuracy (0.968) and test accuracy (0.929) show that the fit still works on new data.
+- **For comparison,** the linear SVM uses fewer support vectors (96, 34%), but 76 of them break the margin. It is simpler, but it cannot separate the classes.
+
+**Training points with non-zero hinge loss (hinge > 1e-3):**
+
+| Model | Hinge > 1e-3 | … correct but inside the margin | … misclassified | Largest hinge | Total hinge |
+|---|---|---|---|---|---|
+| RBF (best model), C = 100 | **0** | 0 | 0 | 0.0001 | 0.006 |
+| Linear SVM (2.2.2), C = 0.1 | **76** | 52 | 24 | 3.37 | 60.2 |
+
+**Why they differ:**
+- **RBF bends around every point.** With a large C it pays almost no hinge loss.
+- **The linear SVM has to accept errors.** It can only use a flat boundary and is strongly regularized (C = 0.1), so it accepts 76 margin violations to keep a wide margin.
+- **Zero training loss is not automatically good,** since memorizing also gives zero. Here the CV and test results show RBF is really better.
+
+### The linear SVM's worst points
+
+I sorted the training points by their hinge loss under the linear SVM and inspected the largest ones. The first 5:
+
+| Row | True class | Linear score f(x) | Hinge loss | RBF y·f(x) | a01 | a03 | a05 | Pulse magnitude spread |
+|---|---|---|---|---|---|---|---|---|
+| 126 | bad | +2.37 | 3.37 | 1.0 | 1 | 0.60 | 0.83 | 0.23 |
+| 87 | bad | +1.69 | 2.69 | 1.0 | 1 | 0.73 | 0.89 | 0.31 |
+| 85 | bad | +1.55 | 2.55 | 1.0 | 1 | 0.39 | 0.98 | 0.30 |
+| 148 | bad | +1.18 | 2.18 | 1.0 | 1 | 0.85 | 1.00 | 0.24 |
+| 116 | bad | +1.14 | 2.14 | 1.0 | 1 | 1.00 | 1.00 | 0.23 |
+
+**Group comparison** (medians):
+
+| Group | Rows | a03 | a05 | Distance to good-class centre | Mean pulse magnitude | Pulse magnitude spread | Values exactly 0 or ±1 |
+|---|---|---|---|---|---|---|---|
+| Top 15 by hinge loss (linear) | 15 | 0.853 | 0.997 | 4.70 | 0.842 | **0.274** | 7 |
+| Other bad returns | 86 | 0.137 | 0.000 | 7.55 | 0.744 | 0.419 | 23 |
+| Good returns | 180 | 0.905 | 0.868 | 3.49 | 0.843 | **0.092** | 2 |
+
+(Pulse magnitude = √(a_odd² + a_even²) for each of the 16 pulses a03/a04, …, a33/a34.)
+
+**Is there a pattern? Yes.**
+- **They are all bad returns called "good".** All 15 of the largest hinge losses are bad returns (17 of the top 20), and the linear SVM gives every one of them a **positive score**. It is confidently calling them "good", with scores up to +2.4.
+- **On the features the linear model uses, they look like good returns.**
+  - They have `a01 = 1` and strong first pulses (a03 ≈ 0.85, a05 ≈ 1.00), just like good returns and unlike other bad ones.
+  - They sit close to the good-class centre (4.7, against 3.5 for good and 7.5 for other bad returns).
+  - Their average pulse strength (0.84) is the same as that of good returns.
+- **Where they differ is steadiness across the 16 pulses.** How much their pulse strength changes from pulse to pulse is **0.27, three times that of good returns (0.09)**. They are strong but uneven signals. Several also have many values stuck exactly at 0 or ±1.
+- **The RBF model gets all of them right** (y·f(x) = 1.0, exactly on its margin). The information needed to separate them exists, but one flat boundary over the raw features cannot use it.
+
+**Proposed change (not implemented): give the linear SVM pulse-strength features.**
+1. For each of the 16 pulses, add the magnitude |zₖ| = √(a₂ₖ₊₁² + a₂ₖ₊₂²) of the complex value stored in the pair (a03, a04), …, (a33, a34).
+2. Also add one summary feature: **how much these magnitudes vary across the pulses** (their standard deviation).
+3. Standardize the new features with training statistics, like the others.
+
+A linear model cannot compute a square root of squares or a spread across columns by itself, but it can give them a weight once they are handed to it as features.
+
+**What I would expect to happen:**
+- **The look-alike bad returns get pushed towards "bad".** The spread feature separates them from good returns (0.27 vs 0.09), so many of the 15 largest hinge losses should drop, and the linear model should let fewer bad returns through on the test set (now 6).
+- **Linear CV accuracy should rise.** It should go from 0.879 towards the kernel models (0.92–0.97), while the model stays linear, fast and easy to read: its weights would directly say "uneven pulse strength means bad".
+- **It would probably not fully reach RBF,** because some of these points look like good returns on almost every feature. It should still close a big part of the gap.
